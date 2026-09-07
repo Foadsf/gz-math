@@ -35,8 +35,7 @@ jobs:
               -DCMAKE_BUILD_TYPE=Release ^
               -DBUILD_TESTING=ON ^
               -DBUILD_DOCS=OFF ^
-              -DSKIP_SWIG=ON ^
-              -DSKIP_PYBIND11=ON
+              -DSKIP_SWIG=ON
 
       - name: Build
         shell: cmd
@@ -47,7 +46,7 @@ jobs:
       - name: Test
         shell: cmd
         run: |
-          pixi run --manifest-path .github/ci/windows/pixi.toml ctest --test-dir build --output-on-failure -j4
+          pixi run --manifest-path .github/ci/windows/pixi.toml cmd /c "set PYTHONPATH=%GITHUB_WORKSPACE%\build\python;%PYTHONPATH% && ctest --test-dir build --output-on-failure -j4"
 
       - name: Upload test logs on failure
         if: failure()
