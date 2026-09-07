@@ -36,7 +36,7 @@ jobs:
               -DBUILD_TESTING=ON ^
               -DBUILD_DOCS=OFF ^
               -DSKIP_SWIG=ON ^
-              -DSKIP_PYBIND11=ON
+              -DSKIP_PYBIND11=OFF
 
       - name: Build
         shell: cmd
@@ -46,6 +46,8 @@ jobs:
 
       - name: Test
         shell: cmd
+        env:
+          PYTHONPATH: ${{ github.workspace }}\build\python
         run: |
           pixi run --manifest-path .github/ci/windows/pixi.toml ctest --test-dir build --output-on-failure -j4
 
