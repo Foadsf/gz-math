@@ -15,8 +15,11 @@ for job in workflow.get('jobs', {}).values():
         if step.get('name') == 'Configure':
             configure_step_found = True
             run_cmd = step.get('run', '')
-            if 'SKIP_PYBIND11' in run_cmd:
-                print("Error: SKIP_PYBIND11 is still present in the Configure step.")
+            if '-DSKIP_PYBIND11=ON' in run_cmd:
+                print("Error: -DSKIP_PYBIND11=ON is still present in the Configure step.")
+                sys.exit(1)
+            elif '-DSKIP_PYBIND11=OFF' not in run_cmd:
+                print("Error: -DSKIP_PYBIND11=OFF is required to enable pybind11 explicitly for MSVC.")
                 sys.exit(1)
 
 if not configure_step_found:
