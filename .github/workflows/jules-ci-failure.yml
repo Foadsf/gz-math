@@ -36,6 +36,22 @@ run-name: "jules-watch ${{ github.event.workflow_run.head_branch }}"
 #
 #  3. The open-PR / long-lived-branch requirement. A failure on some abandoned
 #     side branch is not worth a task.
+#
+#  4. Flakes are RE-RUN, not diagnosed. Measured 2026-09-07 on run
+#     34140541655: Ubuntu Resolute CI went red on a single timeout,
+#     `331 - INTEGRATION_triggered_camera (Timeout)`, with 352 of 353 tests
+#     passing, while upstream gazebosim/gz-sim main passed the same day.
+#     There was nothing to fix, and a Jules task was spent confirming that.
+#     So when the build SUCCEEDED and only the test phase failed, the failed
+#     jobs are re-run once first; Jules is called only if it fails again.
+#     A compile or configure failure is deterministic and goes straight to
+#     Jules without wasting a re-run.
+
+# NOTE on the `KeyError: 'disabled'` traceback from /junit_to_md.py that
+# appears in these logs: it is COSMETIC. gazebo-tooling/action-gz-ci runs that
+# script as `python3 /junit_to_md.py ... || true`, so it cannot fail the job;
+# the exit code comes from `make test`. Do not let a diagnosis treat it as a
+# cause. It is a real bug, but it belongs upstream in action-gz-ci.
 
 on:
   workflow_run:
@@ -52,7 +68,9 @@ concurrency:
 
 permissions:
   contents: read
-  actions: read
+  # write, not read: this workflow re-runs the failed jobs once before
+  # spending a Jules task (see point 4 above).
+  actions: write
   pull-requests: read
 
 env:
@@ -66,12 +84,64 @@ jobs:
       github.event.workflow_run.event != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
+      - name: Collect the failing log
+        id: log
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -uo pipefail
+
+          # Jules has NO authenticated GitHub API access. Measured 2026-09-07:
+          # session 4335597769314810284 stalled asking a human for the ctest
+          # output after 403/404 on the REST API, the gh CLI, the raw log URLs
+          # and HTML scraping. So the log has to travel inside the prompt --
+          # telling Jules to "read the failed run's logs" cannot work.
+          if ! gh run view "$RUN_ID" --repo "$REPO" --log-failed > /tmp/failed.log 2>/dev/null; then
+            echo "::warning::Could not download the failed log; dispatching without an excerpt."
+            : > /tmp/failed.log
+          fi
+
+          # Strip ANSI colour and the "job<TAB>step" columns gh prefixes.
+          sed -e 's/\x1b\[[0-9;]*m//g' -e 's/^[^\t]*\t[^\t]*\t//' /tmp/failed.log > /tmp/clean.log
+
+          # Anchor on the LAST line that names a failure, and take a window
+          # around it. A plain tail does NOT work: the end of a job log is
+          # post-job git-credential teardown, so a 200-line tail of the
+          # Windows run was almost entirely cleanup noise with the ctest
+          # summary barely inside it. Verified on two real logs of different
+          # shape -- a ctest run and a Bazel compile failure -- that this
+          # window contains the summary line, the failed-test list, and the
+          # originating error respectively.
+          anchor=$(grep -n -E '##\[error\]|tests passed,|The following tests FAILED|ERROR: |error: |FAILED:' /tmp/clean.log \
+            | tail -1 | cut -d: -f1)
+          if [ -z "${anchor:-}" ]; then
+            tail -n 200 /tmp/clean.log > /tmp/excerpt.txt
+          else
+            start=$(( anchor - 180 )); [ "$start" -lt 1 ] && start=1
+            sed -n "${start},$(( anchor + 15 ))p" /tmp/clean.log > /tmp/excerpt.txt
+          fi
+          tail -c 12000 /tmp/excerpt.txt > /tmp/excerpt.trim && mv /tmp/excerpt.trim /tmp/excerpt.txt
+
+          if [ ! -s /tmp/excerpt.txt ]; then
+            echo "(the log could not be retrieved by the workflow either)" > /tmp/excerpt.txt
+          fi
+          echo "excerpt: $(wc -l < /tmp/excerpt.txt) lines, $(wc -c < /tmp/excerpt.txt) bytes"
+
+          {
+            echo 'excerpt<<JULES_LOG_EOF'
+            cat /tmp/excerpt.txt
+            echo 'JULES_LOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Decide whether to dispatch
         id: guard
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ github.event.workflow_run.head_branch }}
           REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
 
@@ -81,9 +151,16 @@ jobs:
           # is always the default branch, so the count would be 0 forever and
           # the cap would never engage.
           #
-          # A run that declined to dispatch is counted too. Declining is
-          # terminal -- the branch had no open PR, so no new commit lands and
-          # no new trigger occurs -- so conflating the two costs nothing real.
+          # Every successful run of this workflow counts, including ones that
+          # declined to dispatch. For the no-open-PR decline that is harmless,
+          # because declining is terminal there: no new commit lands, so no
+          # new trigger occurs. For the flake re-run below it is NOT terminal,
+          # and the consequence is deliberate but worth stating plainly: the
+          # re-run consumes one unit of the budget, so a branch that starts
+          # with a flake gets MAX_ATTEMPTS-1 real Jules dispatches rather than
+          # MAX_ATTEMPTS, and the "Attempt N of M" line in the prompt counts
+          # that re-run as attempt 1. Erring toward fewer dispatches is the
+          # safe direction; raise MAX_ATTEMPTS if that proves too tight.
           #
           # Limitation, stated rather than hidden: this reads one page of the
           # most recent runs across all branches. If this workflow accumulates
@@ -133,60 +210,24 @@ jobs:
             exit 0
           fi
 
+          # A flake is not worth a Jules task. If the build got as far as
+          # running tests -- so this is not a deterministic compile or
+          # configure error -- re-run the failed jobs once and stop. If the
+          # same failure comes back, the next invocation sees attempts>0 and
+          # goes to Jules. Measured on run 34140541655: 352 of 353 tests
+          # passed and the only failure was a timeout, while upstream was
+          # green; that cost a Jules task for a diagnosis of "flake".
+          if [ "$attempts" -eq 0 ] && grep -qE 'tests passed,|\(Timeout\)' /tmp/excerpt.txt; then
+            echo "::notice::Test-phase failure and no prior attempt on $BRANCH. Re-running the failed jobs once before spending a Jules task."
+            if gh run rerun "$RUN_ID" --repo "$REPO" --failed; then
+              echo "dispatch=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::warning::Re-run could not be started; falling through to Jules."
+          fi
+
           echo "dispatch=true" >> "$GITHUB_OUTPUT"
           echo "attempt=$((attempts + 1))" >> "$GITHUB_OUTPUT"
-
-      - name: Collect the failing log
-        id: log
-        if: steps.guard.outputs.dispatch == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
-        run: |
-          set -uo pipefail
-
-          # Jules has NO authenticated GitHub API access. Measured 2026-09-07:
-          # session 4335597769314810284 stalled asking a human for the ctest
-          # output after 403/404 on the REST API, the gh CLI, the raw log URLs
-          # and HTML scraping. So the log has to travel inside the prompt --
-          # telling Jules to "read the failed run's logs" cannot work.
-          if ! gh run view "$RUN_ID" --repo "$REPO" --log-failed > /tmp/failed.log 2>/dev/null; then
-            echo "::warning::Could not download the failed log; dispatching without an excerpt."
-            : > /tmp/failed.log
-          fi
-
-          # Strip ANSI colour and the "job<TAB>step" columns gh prefixes.
-          sed -e 's/\x1b\[[0-9;]*m//g' -e 's/^[^\t]*\t[^\t]*\t//' /tmp/failed.log > /tmp/clean.log
-
-          # Anchor on the LAST line that names a failure, and take a window
-          # around it. A plain tail does NOT work: the end of a job log is
-          # post-job git-credential teardown, so a 200-line tail of the
-          # Windows run was almost entirely cleanup noise with the ctest
-          # summary barely inside it. Verified on two real logs of different
-          # shape -- a ctest run and a Bazel compile failure -- that this
-          # window contains the summary line, the failed-test list, and the
-          # originating error respectively.
-          anchor=$(grep -n -E '##\[error\]|tests passed,|The following tests FAILED|ERROR: |error: |FAILED:' /tmp/clean.log \
-            | tail -1 | cut -d: -f1)
-          if [ -z "${anchor:-}" ]; then
-            tail -n 200 /tmp/clean.log > /tmp/excerpt.txt
-          else
-            start=$(( anchor - 180 )); [ "$start" -lt 1 ] && start=1
-            sed -n "${start},$(( anchor + 15 ))p" /tmp/clean.log > /tmp/excerpt.txt
-          fi
-          tail -c 12000 /tmp/excerpt.txt > /tmp/excerpt.trim && mv /tmp/excerpt.trim /tmp/excerpt.txt
-
-          if [ ! -s /tmp/excerpt.txt ]; then
-            echo "(the log could not be retrieved by the workflow either)" > /tmp/excerpt.txt
-          fi
-          echo "excerpt: $(wc -l < /tmp/excerpt.txt) lines, $(wc -c < /tmp/excerpt.txt) bytes"
-
-          {
-            echo 'excerpt<<JULES_LOG_EOF'
-            cat /tmp/excerpt.txt
-            echo 'JULES_LOG_EOF'
-          } >> "$GITHUB_OUTPUT"
 
       - name: Invoke Jules
         if: steps.guard.outputs.dispatch == 'true'
